@@ -1,11 +1,15 @@
 #!/usr/bin/env python
 
 import json
+import re
 import sys
+import time
 from argparse import ArgumentParser
+from queue import Queue
 
 import requests as rq
 from bs4 import BeautifulSoup
+from loguru import logger
 
 
 def parse_arguments():
@@ -25,6 +29,20 @@ def parse_arguments():
         type = str,
         help = 'The name of the output file',
         required = True,
+    )
+    ap.add_argument(
+        '--delay',
+        '-d',
+        type = float,
+        help = 'Delay before downloads (real number; defaults to 0)',
+        default = 0.0,
+    )
+    ap.add_argument(
+        '--max-iterations',
+        '-m',
+        type = int,
+        help = 'Max iterations',
+        default = 1000,
     )
 
     return ap.parse_args()
@@ -72,8 +90,8 @@ def find_links(html):
         yield (text, href)
 
 
-def is_https(url):
-    return url.startswith('https://')
+def is_internal(url):
+    return url.startswith('/wiki/')
 
 
 def write_json(data, filename):
@@ -84,14 +102,67 @@ def write_json(data, filename):
         raise Exception(f'Failed to write file: {e}') from e
 
 
+def make_absolute(url, lang):
+    return f'https://{lang}.wikipedia.org' + url
+
+
+def recursive_download_and_parse(url, lang, iteration_limit=1000, delay=0):
+    # Not actually recursive because downloading is DFS (Depth First Search) manner with the limit on
+    # the number on iterations instead of the recursion depth doesn't make much sense. Instead, the BFS-like
+    # algorithm is used
+    #
+    # Yields:
+    #     Pairs of (text, href) of internal links
+
+    task_queue = Queue(iteration_limit + 10)
+    task_queue.put(url)
+
+    iterations = 0
+    while not task_queue.empty() and iterations < iteration_limit:
+        current_url = task_queue.get_nowait()
+        iterations += 1
+        logger.info('Iteration {}: get {}', iterations, current_url)
+        try:
+            html = download_html_page(current_url)
+            internal_links = (
+                (text, make_absolute(href, lang=lang))
+                for text, href in find_links(html)
+                if is_internal(href)
+            )
+            for text, href in internal_links:
+                yield text, href
+                if not task_queue.full():
+                    task_queue.put_nowait(href)
+            time.sleep(delay)
+        except Exception as e:
+            logger.error(e)
+            continue
+
+
+def parse_url(url):
+    return re.match(r'https?://([a-z]+)[.]wikipedia.org/', url)
+
+
 def main():
     try:
         config = parse_arguments()
-        html = download_html_page(config.url)
-        https_links = [(text, url) for text, url in find_links(html) if is_https(url)]
-        write_json(data=https_links, filename=config.output)
+        parsed_url = parse_url(config.url)
+        if parsed_url is None:
+            raise Exception('The program can only work with wikipedia urls: http(s)://<lang>.wikipedia.org')
+        lang = parsed_url.group(1)
+
+        result = dict(
+            recursive_download_and_parse(
+                config.url,
+                iteration_limit = config.max_iterations,
+                delay = config.delay,
+                lang = lang,
+            )
+        )
+        write_json(result, config.output)
+
     except Exception as e:
-        print(f'Error: {e}', file=sys.stderr)
+        logger.error('Error: {}', e)
         sys.exit(1)
 
 
